@@ -1,1 +1,14 @@
-[{"version": "3.5", "title": "3.5", "aliases": ["latest"]}]
+[
+  {
+    "version": "4.1",
+    "title": "4.1",
+    "aliases": [
+      "latest"
+    ]
+  },
+  {
+    "version": "3.5",
+    "title": "3.5",
+    "aliases": []
+  }
+]
