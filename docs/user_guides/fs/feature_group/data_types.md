@@ -165,15 +165,36 @@ The byte size of each column is determined by its data type and calculated as fo
 
 For online enabled feature groups, the dataframe to be ingested needs to adhere to the online schema definitions.
 The input dataframe is validated for schema checks accordingly.
-The validation is enabled by default and can be disabled by setting below key word argument when calling `insert()`
+
+The validation is enabled by default for online enabled feature groups only.
+Every check it performs comes from a limit of the online feature store, so it is skipped for a feature group created with `online_enabled=False`.
+On the Spark engine the checks require a separate pass over the input dataframe, which re-runs the query that produced it before the write.
+
+Disable it for an online enabled feature group:
 
 === "Python"
 
     ```python
     feature_group.insert(
-        df, validation_options={"online_schema_validation": False}
+        df, validation_options={"schema_validation": False}
     )
     ```
+
+Enable it for an offline only feature group:
+
+=== "Python"
+
+    ```python
+    feature_group.insert(
+        df, validation_options={"schema_validation": True}
+    )
+    ```
+
+The primary key null check described below is the one check an offline only feature group gives up by default.
+A feature group using the `HUDI` or `DELTA` time travel format matches rows on the primary key when upserting, and a null key matches nothing, so rows with null keys are inserted as new rows on every insert.
+Set `{"schema_validation": True}` if your offline pipeline cannot guarantee non-null primary keys.
+
+The `online_schema_validation` key is accepted as an older spelling of `schema_validation` and behaves the same way.
 
 The most important validation checks or error messages are mentioned below along with possible corrective actions.
 
