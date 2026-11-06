@@ -1862,7 +1862,7 @@ uv pip install "hopsworks[python,great-expectations,polars]"
 
 ## Skills and instructions for coding agents
 
-The Hopsworks Python library ships a set of skills for coding agents: Claude Code, Codex, GitHub Copilot and OpenCode.
+The Hopsworks Python library ships a set of skills for coding agents: Claude Code, Codex, GitHub Copilot, OpenCode, pi and Hermes Agent.
 Inside a Hopsworks terminal they are available to every agent automatically.
 On your own machine, two commands make them available in the repository you are working in.
 
@@ -1891,7 +1891,7 @@ It then writes the following files into the current directory:
 | `.claude/agents/hops-infer-agent.md` | The Claude Code sub-agent `/hops-build` runs to build inference until it meets its SLA. |
 | `.claude/settings.local.json` | Allows `Bash(hops *)`, so Claude Code can run the CLI without asking before each command. |
 
-`AGENTS.md` is read by Claude Code, Codex, GitHub Copilot and OpenCode.
+`AGENTS.md` is read by Claude Code, Codex, GitHub Copilot, OpenCode, pi and Hermes Agent.
 The files under `.claude/` are read by Claude Code only.
 Running `hops setup` again in a directory that already has these files updates the files you have not edited and leaves the ones you have edited unchanged.
 A file an earlier version wrote and this one no longer ships, such as `.claude/agents/hops-fti.md`, is removed when you have not edited it and reported otherwise.
@@ -1910,9 +1910,13 @@ For another agent, pass `--agent`, which can be repeated:
 hops skills install --agent codex
 hops skills install --agent copilot
 hops skills install --agent opencode
+hops skills install --agent pi
+hops skills install --agent hermes
 ```
 
-The skills are written to `.codex/skills/`, `.agents/skills/` and `.opencode/skills/` respectively, and for OpenCode the path is also registered in `opencode.json`.
+The skills are written to `.codex/skills/` for Codex, `.opencode/skills/` for OpenCode, where the path is also registered in `opencode.json`, and `.agents/skills/` for GitHub Copilot, pi and Hermes Agent, which share that directory.
+pi asks whether to trust the repository the first time it starts there, and loads the skills once you do.
+Hermes Agent loads a repository's skills only in a git repository you have trusted, so run `hermes skills trust <your-repository>` once after installing them.
 An agent loads only the name and description of each skill when it starts and reads a skill in full when a task calls for it, so adding all of them costs a few kilobytes of context rather than the size of the skills themselves.
 
 Running `hops skills install` again after upgrading the `hopsworks` library updates the skills you have not edited, keeps the skills you have edited, and removes skills that the new version no longer ships.
@@ -2580,6 +2584,22 @@ Cloud agnostic storage systems:
     Connect to supported CRM, sales, and analytics platforms.
 
     [:octicons-arrow-right-24: Configure](creation/crm_sales_analytics.md)
+
+- :simple-gmail:{ .lg .middle style="color:#EA4335" } **Gmail**
+
+    ---
+
+    Copy a mailbox into a Delta feature group with a scheduled sync job.
+
+    [:octicons-arrow-right-24: Configure][data-source-gmail]
+
+- :material-microsoft-outlook:{ .lg .middle style="color:#0078D4" } **Outlook**
+
+    ---
+
+    Copy a Microsoft 365 or Outlook.com mailbox into a Delta feature group with a scheduled sync job.
+
+    [:octicons-arrow-right-24: Configure][data-source-outlook]
 
 - :material-folder-network-outline:{ .lg .middle style="color:var(--hops-accent-text)" } **HopsFS**
 
@@ -3825,6 +3845,72 @@ Spark and the query engine use Microsoft's JDBC driver, so other JDBC connection
 The argument `encrypt=false` therefore turns off encryption for Spark and the query engine only: the Python engine and DLTHub ingestion always encrypt.
 The arguments cannot replace the host, port or database (`serverName`, `portNumber`, `databaseName`); the data source's own fields set those.
 
+### FILESTREAM and binary columns as files { #data-source-sqlserver-files }
+
+An ingestion job can copy the values of a SQL Server table's large binary columns into files in the project, instead of storing the bytes in the feature group.
+Every FILESTREAM column is stored as files.
+A `varbinary(max)` or `image` column is stored as files when you select **Store as files** for it in the ingestion wizard, or list it in `file_columns`.
+
+For each such column, the feature group holds two features:
+
+- The column's own feature, a `string` with the full path of the file, such as `/Projects/sales/Resources/erp/Sales/dbo/Documents/c-Body/3f/v-42`.
+- `<column>_size`, a `bigint` with the length of the value in bytes.
+
+A NULL value gives a NULL path and a NULL size, and an empty value gives an empty file and the size 0.
+The preview in the wizard shows the size of each value instead of its bytes.
+In the SDK, `get_data(file_columns=[...])` returns the features as an ingestion job stores them; pass `file_columns=[]` for a table whose only file columns are FILESTREAM columns.
+Without `file_columns`, `get_data` returns the source schema, which is what an external feature group uses.
+`data.column_metadata` lists each source column's type and whether it is, or can be, stored as files.
+
+A feature group created before this feature, with a `binary` feature for the column, keeps copying the bytes into the feature group.
+To store the values as files instead, create a new feature group with the path and size features.
+
+```python
+from hopsworks_common.core.sink_job_configuration import SinkJobConfiguration
+
+documents = fs.get_data_source("erp").get_tables("Sales")[0]
+data = documents.get_data(file_columns=["Body"])
+
+fg = fs.get_or_create_feature_group(
+    name="documents",
+    version=1,
+    primary_key=["id"],
+    features=data.features,
+    data_source=documents,
+    sink_enabled=True,
+    sink_job_conf=SinkJobConfiguration(
+        write_mode="MERGE",
+        file_columns=["Body"],
+        files_directory="Resources/documents",
+    ),
+)
+fg.save()
+```
+
+The files are written under the files directory, by default `Resources/<data source>/<database>/<schema>/<table>`.
+It must be a directory inside a dataset, outside `Resources/jobs` and the ingestion state under `Resources/dlthub-warehouse`, and it cannot overlap the files directory of another table or job.
+Each file is named after the row's primary key, under one directory per column and one of 256 subdirectories per column.
+The directory also holds `.hopsworks-files.json`, which names the job and feature group it belongs to, and `.hopsworks-files.lease`, which keeps two runs from writing it at the same time.
+A job refuses a directory that belongs to another job or feature group, or that holds files but no `.hopsworks-files.json`.
+
+The feature group needs a primary key, since it names the files.
+It must be written by one ingestion job only: a job with file columns cannot share its feature group with another ingestion job.
+A file column keeps its path and size features while it keeps its files directory; to store it under other features, choose another files directory.
+Its columns must be non-NULL and include every column of the table's primary key or of one of its unique indexes.
+A date and time key is matched to the microsecond, so two rows whose keys differ by less than a microsecond fail the run.
+A value can be at most 2147483647 bytes.
+
+A run writes each file before it loads the row, and replaces a file that already exists, so a row always points at a complete file.
+Incremental ingestion needs the `MERGE` write mode, and picks up a changed value only with a cursor column that changes when the row is updated, such as a `datetime2` updated-at column.
+After a run succeeds, it deletes the files that no row of the feature group references, such as the files of deleted rows on a full load and of values that became NULL.
+A failed run deletes nothing, and the next successful run deletes what it left.
+A run that fails after writing files but before loading their rows leaves files that no row references yet, so a file in the files directory is not proof that its row was loaded: read the paths from the feature group.
+Earlier versions of the feature group can point at files that a later run replaced or deleted, so reading a file column at an earlier commit is not supported.
+Write the path features only through the ingestion job: a path written by another job or by an insert can point at a file that the next run deletes.
+
+Deleting the feature group, the job or the data source leaves the files in place.
+To remove them, delete the files directory in the file browser, or with `project.get_dataset_api().remove("Resources/documents")`.
+
 ## Provided credentials for Oracle { #data-source-provided-credentials }
 
 A data source has a credentials mode.
@@ -4699,6 +4785,677 @@ Spark cannot read an external feature group on a Hopsworks data source, so creat
 The data source can also be used with the dltHub-based ingestion workflow described in [Ingest Data with dltHub][ingest-data-with-dlthub], to copy a remote feature group into a managed feature group of this cluster.
 The ingestion job supports full loads and incremental loads.
 For an incremental load, the remote query only returns rows whose cursor column is at least the last value the previous run loaded.
+
+================================================================================
+# Gmail
+Source: https://docs.hopsworks.ai/latest/user_guides/fs/data_source/creation/gmail/
+
+# How-To set up a Gmail Data Source { #data-source-gmail }
+
+## Introduction
+
+A Gmail data source is one Gmail or Google Workspace mailbox, read with the `https://www.googleapis.com/auth/gmail.readonly` scope.
+It holds the mailbox address and its credentials: an OAuth client with a refresh token, or a Google Workspace service account with domain-wide delegation.
+
+A Gmail data source is not browsed or mounted as an external feature group.
+A sync job copies the mailbox into a Delta feature group, on demand, hourly or daily, and writes the attachments as files in the project.
+You then read the emails like any feature group, or search them with DuckDB from a Hopsworks terminal.
+
+## Prerequisites
+
+You need the email address of the mailbox and one of the two kinds of credentials below.
+Both are created in the [Google Cloud console](https://console.cloud.google.com/), in a Google Cloud project that has the [Gmail API](https://console.cloud.google.com/apis/library/gmail.googleapis.com) enabled.
+
+### OAuth client and refresh token
+
+Use this for a personal Gmail account, or for a Google Workspace mailbox whose owner grants access.
+
+1. In the Google Cloud project, configure the OAuth consent screen.
+2. Under `APIs & Services` > `Credentials`, create an `OAuth client ID` of type `Web application`.
+    Add `https://developers.google.com/oauthplayground` as an authorized redirect URI, so that the OAuth 2.0 Playground can receive the authorization code.
+    Note the **client ID** and the **client secret**.
+3. Open the [OAuth 2.0 Playground](https://developers.google.com/oauthplayground).
+    In its settings, check `Use your own OAuth credentials` and enter the client ID and the client secret.
+    The refresh token is then issued to your client, which Hopsworks uses to renew it.
+4. In `Step 1`, enter the scope `https://www.googleapis.com/auth/gmail.readonly` and nothing else, click `Authorize APIs`, and sign in as the owner of the mailbox.
+5. In `Step 2`, click `Exchange authorization code for tokens` and copy the **refresh token**.
+
+While the consent screen's publishing status is `Testing`, Google lets refresh tokens of external users expire after seven days.
+Publish the consent screen, or use an `Internal` consent screen in Google Workspace, so that the sync jobs keep working.
+
+### Google Workspace service account with domain-wide delegation
+
+Use this for a mailbox in a Google Workspace domain that you administer.
+
+1. In the Google Cloud project, under `IAM & Admin` > `Service accounts`, create a service account.
+2. Under the service account's `Keys` tab, add a key of type JSON and download it.
+3. Note the service account's unique **client ID**, shown on its details page.
+4. In the Google Workspace Admin console, open `Security` > `Access and data control` > `API controls` > `Manage Domain Wide Delegation`.
+    Add the client ID with the single scope `https://www.googleapis.com/auth/gmail.readonly`.
+5. Upload the JSON key to the project, for example to the `Resources` dataset.
+    Hopsworks stores the key's contents when you save the data source, so delete the file from the project afterwards.
+
+!!! warning
+    A service account with domain-wide delegation can read every mailbox in the domain, since it can impersonate any user.
+    The data source reads only the mailbox it names, but anyone holding the key can read the others, so keep the key out of shared datasets and delete the uploaded file once the data source is saved.
+
+## Creation in the UI
+
+### Step 1: Set up new Data Source
+
+Head to the `Data Sources` view on Hopsworks and click `New data source`.
+The `Add a data source` catalog opens below.
+Pick the `Gmail` card under `API & SaaS` to open the creation form.
+
+<figure markdown>
+  ![Data Source Creation](../../../../assets/images/guides/fs/data_source/data_source_overview.png)
+  <figcaption>The Data Source View in the User Interface</figcaption>
+</figure>
+
+### Step 2: Enter the mailbox and credentials
+
+Start by giving the data source a **name** and an optional **description**.
+
+1. Enter the **Mailbox**, the email address to read.
+2. Under **Authentication**, pick `OAuth client` or `Service account`.
+3. For OAuth, enter the **Client ID**, the **Client secret** and the **Refresh token**.
+    For a service account, pick or upload the JSON key in **Service account key file**.
+4. Click `Test connection`.
+    Hopsworks requests an access token with the credentials and reads the mailbox profile, and answers with the mailbox and its number of messages, such as `Connected to alice@example.com (1234 messages)`.
+    When Google refuses the credentials, the error carries Google's reason, such as `invalid_grant` for a revoked or expired refresh token.
+5. Save the data source.
+
+## Creation with the Python SDK
+
+```python
+import hopsworks
+from hsfs.storage_connector import GmailConnector
+
+
+project = hopsworks.login()
+fs = project.get_feature_store()
+
+gmail = GmailConnector(
+    id=None,
+    name="support_inbox",
+    featurestore_id=fs.id,
+    mailbox="support@example.com",
+    auth_type="OAUTH",
+    client_id="1234567890-abc.apps.googleusercontent.com",
+    client_secret="...",
+    refresh_token="...",
+)
+gmail.save()
+```
+
+For a service account, pass `auth_type="SERVICE_ACCOUNT"` and `key_path` instead of the three OAuth arguments, with the HopsFS path of the uploaded key, such as `key_path="Resources/gmail-sa.json"`.
+
+## Creation with the CLI
+
+```bash
+hops datasource create gmail support_inbox \
+    --mailbox support@example.com --auth-type OAUTH \
+    --client-id 1234567890-abc.apps.googleusercontent.com \
+    --client-secret - --refresh-token - < secrets.txt
+```
+
+A secret option given as `-` reads one line from standard input, and each option also reads the environment variable `HOPSWORKS_DS_GMAIL_<OPTION>`, such as `HOPSWORKS_DS_GMAIL_REFRESH_TOKEN`, so secrets do not appear on the command line.
+For a service account, use `--auth-type SERVICE_ACCOUNT --key-path Resources/gmail-sa.json`.
+
+## Credentials
+
+The credentials are write-only.
+Hopsworks never returns the client secret, the refresh token or the service account key: reading the data source back returns `credentials_set`, the `client_id` for OAuth, and the `service_account_email` of the stored key.
+When you edit the data source, leave a secret field empty to keep the stored value.
+Switching between OAuth and a service account needs all the credentials of the new type.
+
+To call the [Gmail API](https://developers.google.com/gmail/api/reference/rest) from your own code, ask the data source for a short-lived access token.
+The token has the `gmail.readonly` scope and expires within an hour, so ask for a new one when it is about to expire.
+
+```python
+import hopsworks
+import requests
+
+
+project = hopsworks.login()
+fs = project.get_feature_store()
+
+gmail = fs.get_data_source("support_inbox").storage_connector
+token = gmail.get_access_token()
+labels = requests.get(
+    f"https://gmail.googleapis.com/gmail/v1/users/{token.mailbox}/labels",
+    headers={"Authorization": f"Bearer {token.token}"},
+    timeout=60,
+).json()
+```
+
+`token.expires_at` is the expiry in epoch milliseconds.
+
+!!! warning "Every project member can read the whole mailbox"
+    Any data scientist or data owner of the project can ask for an access token, and the token reads every message of the mailbox, not only the labels or query of a sync job.
+    A data scientist can also create a sync job with any query and read its feature group.
+    Add a Gmail data source only to a project whose members may read that mailbox, as with the passwords and keys of the other data sources.
+    Deleting the data source needs the data owner role; a sync job can be deleted by its creator or a data owner.
+
+## Sync jobs
+
+A sync job is a Python job, listed on the `Jobs` page, that copies the mailbox into a feature group.
+It can run on demand, hourly at the top of every hour, or daily at 00:00 UTC, and you can run, schedule and monitor it like any other job.
+
+### The feature group
+
+The job upserts one row per email into a Delta feature group, version 1, that its first run creates.
+
+- **Name:** by default, the mailbox's local part and the first label of its domain, lower case, with every run of other characters replaced by `_`, followed by `s`.
+    `jane.doe@gmail.com` becomes `jane_doe_gmails` and `support@example.com` becomes `support_examples`.
+    A name that would start with a digit is prefixed with `mail_`.
+    You can set another name of lower case letters, digits and `_` that starts with a letter, at most 63 characters long.
+- **Primary key:** `message_id`.
+- **Event time:** `internal_date`, Gmail's `internalDate`: when Gmail accepted the message, or for mail imported into the mailbox, the sender's `Date`.
+- **Partitions:** `day` (`YYYY-MM-DD`) of `internal_date` in UTC.
+    New messages are added as new files, so an hourly job adds about one Parquet file to the current day every hour.
+    The first run after a day ends in UTC compacts that day's files into files of up to 192 MiB, aiming at 100 to 250 MB.
+
+| Column | Type | Content |
+| --- | --- | --- |
+| `message_id` | string | Gmail message id, the primary key |
+| `thread_id` | string | Gmail thread id |
+| `history_id` | string | Gmail history id |
+| `internal_date` | timestamp | Gmail's `internalDate` in UTC, the event time |
+| `day` | string | Receive date, `YYYY-MM-DD`, partition key |
+| `hour` | string | Receive hour, `HH` |
+| `date_header` | string | The raw `Date` header |
+| `from_address` | string | The `From` header |
+| `to_addresses` | array&lt;string&gt; | The `To` addresses |
+| `cc_addresses` | array&lt;string&gt; | The `Cc` addresses |
+| `bcc_addresses` | array&lt;string&gt; | The `Bcc` addresses |
+| `subject` | string | The `Subject` header |
+| `labels` | array&lt;string&gt; | Gmail label ids, such as `INBOX`, `SENT` or `Label_123` |
+| `snippet` | string | Gmail's short preview of the message |
+| `size_estimate` | bigint | Gmail's estimate of the message size in bytes |
+| `body_text` | string | The plain text body, or the HTML body with its tags removed |
+| `attachments` | array&lt;string&gt; | Full paths of the attachment files |
+
+The headers are stored as `from_address`, `to_addresses` and `date_header` because `from`, `to` and `date` are SQL keywords.
+
+### Attachments
+
+Attachments are written as files under the sync job's attachments directory:
+
+```text
+<attachments directory>/day=YYYY-MM-DD/<message_id>/<filename>
+```
+
+The default attachments directory is `Resources/gmail/<feature group>`.
+HopsFS file names are limited to Latin-1 characters, so a sync job replaces any other characters in an attachment's file name with `_` and shortens names longer than 200 bytes; a second attachment with the same name in a message gets a `-2` suffix.
+It must be a directory inside a dataset, outside `Resources/jobs`, and not the dataset itself.
+The `attachments` column lists the full paths of a message's files, such as `/Projects/myproject/Resources/gmail/support_examples/day=2026-10-24/18c2f0a1b2c3d4e5/invoice.pdf`.
+
+### Loading strategies
+
+- `INCREMENTAL_TIMESTAMP` (the default): the first run copies the mailbox from the start date on, or the whole mailbox without one.
+    Every later run upserts only the messages Gmail received since the previous run, whatever their `internal_date`.
+    The first run reads the mailbox a week at a time, oldest first, and upserts every 5000 messages, so the feature group fills while it runs and a run that fails resumes from its last upsert.
+    The upserts are keyed by `message_id`, so a retried run, or a run that overlaps the previous one, never duplicates a message.
+    The schedule starts no run while another run of the job is still copying, so an hourly job first runs once the backfill ends; a run started by hand meanwhile does nothing and succeeds.
+    Gmail limits how many requests a user's mailbox serves per minute, so a backfill of tens of thousands of emails can take hours.
+    A throttled run waits and retries until Gmail serves it again, and never fails because of throttling; the job log reports how often Gmail throttled it.
+- `FULL_LOAD`: every run copies all the selected messages from the start date on, then removes the rows and attachments of the messages it did not copy.
+    The previous rows stay readable while it runs, and a run that fails part way leaves them in place.
+    A run that selects no messages removes every row and its attachments, so a query or labels that match nothing empty the feature group.
+    Other files under the attachments directory are left in place.
+
+The feature group is an archive of the mailbox:
+
+- An incremental run does not remove the messages deleted in Gmail, and does not follow label changes; a full load does.
+- Spam, trash and drafts are not copied.
+- A message whose headers or body cannot be parsed is left out, and the job log names its Gmail message id.
+- Messages received in the last minute are left to the next run, since Gmail can still be indexing them.
+- A message that is imported into the mailbox later with an older receive time, such as mail migrated from another account, falls before the incremental cursor and is copied only by a full load.
+- An incremental run refuses a feature group that was filled for a different mailbox, query or labels.
+    After changing the query or the labels, run a full load, or sync into a new feature group.
+
+Two sync jobs, of Gmail or [Outlook][data-source-outlook] data sources, cannot write the same feature group, nor attachment directories that overlap, since their runs would overwrite each other's rows and files.
+A sync job also refuses an attachments directory that holds another feature group's attachments, or attachments it cannot tell are its own, since a full load would delete them; choose a new directory, or delete the old one. The directory's `_sync_owner.json` names the data source and feature group it belongs to.
+
+### Configure a sync job in the UI
+
+Open the data source from the `Data Sources` view.
+Its `Sync jobs` card lists the sync jobs with their feature group, attachments directory, mailbox and schedule, and a DuckDB query to copy into a terminal.
+Click `Configure sync job` to create one, or the pencil icon of a sync job to edit it.
+
+1. **Job name:** defaults to `<data source name>_gmail_sync`.
+2. **Feature group:** leave it empty for the default name derived from the mailbox.
+3. **Attachments directory:** leave it empty for `Resources/gmail/<feature group>`, or pick a directory.
+4. **Search query:** optional, a [Gmail search query](https://support.google.com/mail/answer/7190) written as in the Gmail search box, such as `from:billing@example.com has:attachment`.
+5. **Mailboxes:** optional, the labels to sync, such as Inbox or Sent, picked from the mailbox's labels; a message carrying any of the checked labels is copied.
+    With none checked, every message except spam, trash and drafts is copied.
+6. **Loading strategy:** `Incremental` or `Full load (backfill)`, and an optional **Start date**: only emails received on or after it are copied.
+7. **Environment:** the Python environment of the job; left empty, a new job runs in `python-feature-pipeline`.
+8. **Schedule:** `None`, `Hourly` or `Daily` (00:00 UTC).
+9. Check `Start after creation` to run the job when it is saved.
+
+The feature group in the card links to the feature group once the first run has created it.
+
+### Configure a sync job with the Python SDK
+
+```python
+import hopsworks
+
+
+project = hopsworks.login()
+fs = project.get_feature_store()
+
+gmail = fs.get_data_source("support_inbox").storage_connector
+job = gmail.sync(
+    feature_group_name=None,
+    attachments_path=None,
+    query="-category:promotions",
+    labels=["INBOX"],
+    loading_strategy="INCREMENTAL_TIMESTAMP",
+    initial_value="2026-01-01",
+    schedule="hourly",
+    job_name=None,
+    environment=None,
+    start=True,
+)
+```
+
+- `feature_group_name`: defaults to the name derived from the mailbox.
+- `attachments_path`: defaults to `Resources/gmail/<feature group>`.
+- `query`, `labels`: select the messages, as in the UI; `labels` takes label ids, which `get_labels()` lists by name.
+- `loading_strategy`: `INCREMENTAL_TIMESTAMP` or `FULL_LOAD`.
+- `initial_value`: the earliest receive time to copy, as a date or datetime, a date string, or epoch milliseconds.
+- `schedule`: `hourly`, `daily`, or `None` to leave the job's schedule as it is.
+- `job_name`: defaults to `<data source name>_gmail_sync`.
+- `environment`: the Python environment; a new job defaults to `python-feature-pipeline`.
+- `start`: whether to start a run now, without waiting for it.
+
+`sync` returns the job.
+Calling it again with the same `job_name` updates the job.
+`DataSource.sync` takes the same arguments, so `fs.get_data_source("support_inbox").sync(schedule="daily")` does the same.
+
+The data source lists, reads and deletes its sync jobs:
+
+```python
+import hopsworks
+
+
+project = hopsworks.login()
+fs = project.get_feature_store()
+
+gmail = fs.get_data_source("support_inbox").storage_connector
+for config in gmail.list_sync_jobs():
+    print(config.job_name, config.feature_group_name, config.path)
+
+config = gmail.get_sync_job("support_inbox_gmail_sync")
+gmail.delete_sync_job("support_inbox_gmail_sync")
+```
+
+Deleting a sync job deletes the job and its schedule; the feature group and the attachment files stay.
+
+### Configure a sync job with the CLI
+
+```bash
+hops datasource labels support_inbox
+hops datasource sync support_inbox --start-date 2026-01-01 --label INBOX --schedule hourly
+hops datasource sync-jobs support_inbox
+```
+
+`hops datasource sync` takes `--feature-group`, `--attachments-path`, `--query`, `--label` (repeatable), `--strategy`, `--start-date`, `--schedule`, `--job-name`, `--environment` and `--start/--no-start`, with the defaults of the Python SDK.
+`hops datasource labels` lists the ids and names of the mailbox's labels, for `--label`.
+`hops datasource sync-jobs` lists each sync job with its feature group, attachments directory and loading strategy.
+
+!!! api "API reference"
+
+    - <code class="doc-symbol doc-symbol-method"></code> [`FeatureStore.get_data_source`][hsfs.feature_store.FeatureStore.get_data_source]
+    - <code class="doc-symbol doc-symbol-class"></code> [`DataSource`][hsfs.core.data_source.DataSource]
+        - <code class="doc-symbol doc-symbol-method"></code> <autoref identifier="hsfs.core.data_source.DataSource.sync" optional><code>sync</code></autoref>
+    - <code class="doc-symbol doc-symbol-class"></code> <autoref identifier="hsfs.storage_connector.GmailConnector" optional><code>GmailConnector</code></autoref>
+        - <code class="doc-symbol doc-symbol-method"></code> <autoref identifier="hsfs.storage_connector.GmailConnector.get_access_token" optional><code>get_access_token</code></autoref>
+        - <code class="doc-symbol doc-symbol-method"></code> <autoref identifier="hsfs.storage_connector.GmailConnector.sync" optional><code>sync</code></autoref>
+        - <code class="doc-symbol doc-symbol-method"></code> <autoref identifier="hsfs.storage_connector.GmailConnector.list_sync_jobs" optional><code>list_sync_jobs</code></autoref>
+        - <code class="doc-symbol doc-symbol-method"></code> <autoref identifier="hsfs.storage_connector.GmailConnector.get_sync_job" optional><code>get_sync_job</code></autoref>
+        - <code class="doc-symbol doc-symbol-method"></code> <autoref identifier="hsfs.storage_connector.GmailConnector.delete_sync_job" optional><code>delete_sync_job</code></autoref>
+    - <code class="doc-symbol doc-symbol-class"></code> <autoref identifier="hsfs.storage_connector.MailSyncJobConfig" optional><code>MailSyncJobConfig</code></autoref>
+
+    <a class="hops-api-cta" href="../../../../../python-api/hopsworks/">Browse the full Python API :material-arrow-right:</a>
+
+## Read the emails
+
+Read the feature group like any other:
+
+```python
+import hopsworks
+
+
+project = hopsworks.login()
+fs = project.get_feature_store()
+
+emails = fs.get_feature_group("support_examples", version=1).read()
+```
+
+### Search with DuckDB in a terminal
+
+Hopsworks terminals ship the DuckDB 2.0 command-line interface with its `delta` and `fts` extensions preinstalled, so they load without internet access.
+`-init /opt/duckdb/init.sql` loads them.
+DuckDB reads the feature group's Delta table in place, at `/hopsfs/featurestore/<project>_featurestore.db/<feature group>_1` with the project name in lower case.
+
+```bash
+T=/hopsfs/featurestore/myproject_featurestore.db/support_examples_1
+duckdb -init /opt/duckdb/init.sql -c "
+SELECT message_id, internal_date, from_address, subject
+FROM delta_scan('$T')
+WHERE day >= '2026-10-18' AND subject ILIKE '%invoice%'
+ORDER BY internal_date DESC LIMIT 20;"
+```
+
+The DuckDB Python package in the terminal reads the table the same way after `SET extension_directories = ['/opt/duckdb/extensions']; LOAD delta;`.
+
+- Filter on `day` first: DuckDB then reads only those partitions. Add `hour` for a time of day.
+- Select the columns you need, and read `body_text`, the largest column, only for rows already narrowed down.
+- Read the table with `delta_scan`, never with `read_parquet` over its directory: Delta keeps the files that upserts superseded, so `read_parquet` returns the same email more than once.
+- An attachment path `/Projects/<project>/<path>` is at `/hopsfs/<path>` in the terminal.
+
+Claude and the other coding agents in a terminal load the `hops-email-search` skill for questions about the mailbox; it finds the table and shapes the queries this way.
+
+## Delete the data source
+
+Deleting a Gmail data source deletes its sync jobs and their schedules.
+The feature groups and the attachment files stay.
+
+================================================================================
+# Outlook
+Source: https://docs.hopsworks.ai/latest/user_guides/fs/data_source/creation/outlook/
+
+# How-To set up an Outlook Data Source { #data-source-outlook }
+
+## Introduction
+
+An Outlook data source is one Microsoft 365 (Exchange Online) or Outlook.com mailbox, read through [Microsoft Graph](https://learn.microsoft.com/graph/api/resources/mail-api-overview) with the `Mail.Read` permission.
+It holds the mailbox address and the credentials of an app registration in Microsoft Entra ID: a refresh token granted by an account that can read the mailbox, or a client secret of an app that a tenant administrator allowed to read the mailbox.
+
+An Outlook data source works like a [Gmail data source][data-source-gmail].
+A sync job copies the mailbox into a Delta feature group, on demand, hourly or daily, and writes the attachments as files in the project.
+The feature group has the same columns as a Gmail data source's, so you read and search both the same way.
+This page describes what differs from Gmail; the [Gmail page][data-source-gmail] describes the feature group, the attachments, the loading strategies and the DuckDB search in full.
+
+## Prerequisites
+
+You need the email address of the mailbox and an app registration, created in the [Microsoft Entra admin center](https://entra.microsoft.com/) under `Identity` > `Applications` > `App registrations` > `New registration`.
+Note its **Application (client) ID** and its **Directory (tenant) ID**.
+
+### Delegated access with a refresh token
+
+Use this for your own mailbox, on Outlook.com or in a Microsoft 365 organization, or for a shared mailbox that your account can read.
+
+1. Register the app.
+    For an Outlook.com mailbox, pick the supported account types `Accounts in any organizational directory and personal Microsoft accounts`.
+    Add a redirect URI of platform `Web`, `http://localhost`.
+2. Under `API permissions`, add the Microsoft Graph delegated permissions `Mail.Read` and `offline_access`.
+    For a shared mailbox, add `Mail.Read.Shared` too, and request it in the two addresses below.
+3. Under `Certificates & secrets`, add a client secret and copy its **value**.
+4. Open this address in a browser, with your client ID, and sign in as the account that reads the mailbox:
+
+    ```text
+    https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=<client id>&response_type=code&redirect_uri=http://localhost&response_mode=query&scope=offline_access%20https://graph.microsoft.com/Mail.Read
+    ```
+
+    The browser is sent to `http://localhost/?code=...`, which shows nothing; copy the `code` parameter from the address bar.
+5. Exchange the code for tokens within a few minutes:
+
+    ```bash
+    curl -s https://login.microsoftonline.com/common/oauth2/v2.0/token \
+        -d client_id=<client id> -d client_secret=<client secret> \
+        -d grant_type=authorization_code -d redirect_uri=http://localhost \
+        -d scope="offline_access https://graph.microsoft.com/Mail.Read" \
+        --data-urlencode code=<code>
+    ```
+
+    Copy the **refresh token** from the response.
+
+The tenant is `common` here.
+For a work mailbox, you can use your tenant ID instead, in both addresses and in the data source.
+An app registered as a public client, with `Allow public client flows` turned on, needs no client secret; leave it out of the token request and the data source.
+
+Hopsworks reads the mailbox at `users/<mailbox>` in Graph, so the token's account must be the mailbox's owner or have access to it; a token of another account fails with `403` or `404`.
+
+Microsoft replaces the refresh token each time Hopsworks uses it, and Hopsworks stores the new one.
+A refresh token that is not used for 90 days expires, so a data source whose sync job runs at least that often keeps working.
+A password change by the user does not revoke the refresh token of an app that has a client secret.
+To revoke it, remove the app's consent from the account, at [My Apps](https://myapps.microsoft.com/) for a work account or [the app permissions page](https://account.live.com/consent/Manage) for a personal one, or have an administrator revoke the user's sessions, with `Revoke sessions` on the user in the Microsoft Entra admin center or `Revoke-MgUserSignInSession`.
+An administrator's password reset revokes it too.
+See Microsoft's [refresh token revocation](https://learn.microsoft.com/entra/identity-platform/refresh-tokens#token-revocation) table.
+
+### App-only access with client credentials
+
+Use this for mailboxes of a Microsoft 365 organization that you administer, such as a shared support mailbox.
+Grant the app `Mail.Read` for those mailboxes only, with [Exchange Online RBAC for Applications](https://learn.microsoft.com/exchange/permissions-exo/application-rbac).
+Do not grant the Microsoft Graph application permission `Mail.Read` in Microsoft Entra ID: Exchange adds the grants of both, so an Entra grant lets the app read every mailbox of the organization, whatever the Exchange scope.
+If the app already has it, remove it under `API permissions`.
+
+1. Register the app with the supported account types `Accounts in this organizational directory only`.
+2. Under `Certificates & secrets`, add a client secret and copy its **value**.
+3. In the Microsoft Entra admin center, under `Enterprise applications`, open the app and note its **Object ID**.
+4. In [Exchange Online PowerShell](https://learn.microsoft.com/powershell/exchange/connect-to-exchange-online-powershell), give the app `Mail.Read` on the mailboxes a management scope selects, here by their primary address, and check the result:
+
+    ```powershell
+    Connect-ExchangeOnline
+    New-ServicePrincipal -AppId <client id> -ObjectId <object id> -DisplayName "Hopsworks Outlook"
+    New-ManagementScope -Name "Hopsworks mailboxes" `
+        -RecipientRestrictionFilter "PrimarySmtpAddress -eq 'support@contoso.com'"
+    New-ManagementRoleAssignment -App <object id> -Role "Application Mail.Read" `
+        -CustomResourceScope "Hopsworks mailboxes"
+    Test-ServicePrincipalAuthorization -Identity <object id> -Resource support@contoso.com
+    ```
+
+    `Test-ServicePrincipalAuthorization` reports `InScope` as `True` for a mailbox the app can read; try another mailbox to see `False`.
+    The assignment can take up to two hours to apply.
+
+Only data owners of the project can get an access token of an app-only data source, and create or edit its sync jobs.
+A sync job runs as the user who started it, and its schedule as the job's creator, so a run that a data scientist starts fails with error `270024`.
+
+## Creation in the UI
+
+Head to the `Data Sources` view, click `New data source`, and pick the `Outlook` card under `API & SaaS`.
+
+1. Give the data source a **name** and an optional **description**.
+2. Enter the **Mailbox**, the email address to read.
+3. Under **Authentication**, pick `Delegated (OAuth refresh token)` or `App-only (client credentials)`.
+4. Enter the **Tenant ID**: empty for `common` with delegated access, and your tenant's ID or domain, such as `contoso.onmicrosoft.com`, for app-only access.
+5. Enter the **Client ID**, the **Client secret** and, for delegated access, the **Refresh token**.
+6. Click `Test connection`.
+    Hopsworks requests an access token and reads the Inbox, and answers with the mailbox and the Inbox's number of messages, such as `Connected to alice@contoso.com (1234 messages in Inbox)`.
+    When Microsoft refuses the credentials, the error carries Microsoft's reason, such as `invalid_grant` for an expired or revoked refresh token.
+7. Save the data source.
+
+## Creation with the Python SDK
+
+```python
+import hopsworks
+from hsfs.storage_connector import OutlookConnector
+
+
+project = hopsworks.login()
+fs = project.get_feature_store()
+
+outlook = OutlookConnector(
+    id=None,
+    name="support_outlook",
+    featurestore_id=fs.id,
+    mailbox="support@contoso.com",
+    auth_type="CLIENT_CREDENTIALS",
+    tenant_id="contoso.onmicrosoft.com",
+    client_id="00000000-0000-0000-0000-000000000000",
+    client_secret="...",
+)
+outlook.save()
+```
+
+For delegated access, pass `auth_type="OAUTH"` and `refresh_token`; `tenant_id` then defaults to `common`.
+
+## Creation with the CLI
+
+```bash
+hops datasource create outlook support_outlook \
+    --mailbox support@contoso.com --auth-type CLIENT_CREDENTIALS \
+    --tenant-id contoso.onmicrosoft.com \
+    --client-id 00000000-0000-0000-0000-000000000000 \
+    --client-secret - < secret.txt
+```
+
+A secret option given as `-` reads one line from standard input, and each option also reads the environment variable `HOPSWORKS_DS_OUTLOOK_<OPTION>`, such as `HOPSWORKS_DS_OUTLOOK_REFRESH_TOKEN`.
+For delegated access, use `--auth-type OAUTH --refresh-token -`.
+
+## Credentials
+
+The credentials are write-only.
+Hopsworks never returns the client secret or the refresh token: reading the data source back returns `credentials_set`, the `tenant_id` and the `client_id`.
+They are stored as a private secret of the user who saved the data source, and the other members of the project cannot read them.
+When you edit the data source, leave a secret field empty to keep the stored value.
+The stored secrets belong to the authentication type, tenant, client ID and mailbox they were saved with: when you change any of these, enter the secrets again, for the edit and for `Test connection`.
+
+To call Microsoft Graph from your own code, ask the data source for a short-lived access token.
+`token.user_path` is the mailbox's path in Graph, `users/<mailbox>`.
+For app-only access, only data owners get a token.
+
+```python
+import hopsworks
+import requests
+
+
+project = hopsworks.login()
+fs = project.get_feature_store()
+
+outlook = fs.get_data_source("support_outlook").storage_connector
+token = outlook.get_access_token()
+inbox = requests.get(
+    f"https://graph.microsoft.com/v1.0/{token.user_path}/mailFolders/inbox",
+    headers={"Authorization": f"Bearer {token.token}"},
+    timeout=60,
+).json()
+```
+
+## Sync jobs
+
+Sync jobs of an Outlook data source behave as those of a [Gmail data source][data-source-gmail]: the feature group's name, schema and `day` partitions, the attachments directory, the loading strategies, the backfill that upserts as it goes, the hourly runs that wait for it, and the retries while throttled.
+A sync job writes only into a feature group that a sync job of the same data source created; it fails on any other feature group of that name.
+Two sync jobs cannot write the same feature group or overlapping attachment directories, whether they copy Gmail or Outlook.
+A sync job also refuses an attachments directory that holds another feature group's attachments, or attachments it cannot tell are its own, since a full load would delete them; choose a new directory, or delete the old one. The directory's `_sync_owner.json` names the data source and feature group it belongs to.
+The differences:
+
+- **Feature group name:** `jane.doe@outlook.com` becomes `jane_doe_outlooks`, and `support@contoso.com` becomes `support_contosos`.
+- **Default attachments directory:** `Resources/outlook/<feature group>`.
+- **Messages selected:** by folder; there is no search query.
+    A message in any chosen folder is copied, and a chosen folder's subfolders are copied only when chosen too.
+    Without chosen folders, every folder but Deleted Items, Junk Email, Drafts and Outbox, and the folders below them, is copied.
+    A folder deleted in Outlook moves under Deleted Items, so its messages are no longer copied.
+    Drafts are never copied.
+    When a chosen folder is deleted, the next run fails with `edit the sync job's folders`, and copies nothing until you do.
+- **Incremental runs:** each run copies the messages whose `receivedDateTime` is after the previous run's.
+- **Throttling:** Microsoft Graph allows 4 concurrent requests per mailbox and 10,000 requests per 10 minutes per app and mailbox.
+    A throttled run honours Graph's `Retry-After` and retries, and fails once it has waited an hour in total; the next run resumes from its last upsert.
+    A scheduled run that finds the previous one still running does nothing, unless that run has recorded no progress for two hours, in which case it fails, so a stuck job shows.
+- **Message size:** a run reads one message at a time into memory, and needs about five times the message's size on top of about 350 MB.
+    The default 2 GiB of a Python job covers the 150 MB maximum message size of Exchange Online.
+- **Moves:** a message moved to another folder keeps its `message_id`, so it is never copied twice, but its `labels` keep the folder it was in when it was copied until a full load.
+
+| Column | Outlook content |
+| --- | --- |
+| `message_id` | The message's immutable Graph id, the primary key |
+| `thread_id` | Its conversation id |
+| `history_id` | Its change key |
+| `internal_date` | `receivedDateTime`, when it reached the mailbox, in UTC to the second; the event time and the `day` partition |
+| `labels` | The path of its folder, such as `Inbox` or `Inbox/Projects`, then its categories |
+| `snippet` | Graph's body preview |
+| `size_estimate` | The size of its MIME source in bytes |
+
+The other columns are parsed from the message's MIME source, exactly as for Gmail.
+
+### Configure a sync job in the UI
+
+Open the data source from the `Data Sources` view and click `Configure sync job` in its `Sync jobs` card.
+The dialog is the Gmail one, with the job name defaulting to `<data source name>_outlook_sync`, no search query, and **Folders** in place of mailboxes, picked from the mailbox's folders.
+
+### Configure a sync job with the Python SDK
+
+```python
+import hopsworks
+
+
+project = hopsworks.login()
+fs = project.get_feature_store()
+
+outlook = fs.get_data_source("support_outlook").storage_connector
+folders = outlook.get_folders()  # folder paths by id
+inbox = [folder_id for folder_id, path in folders.items() if path == "Inbox"]
+job = outlook.sync(
+    folders=inbox,
+    initial_value="2026-01-01",
+    schedule="hourly",
+)
+```
+
+`sync` takes the arguments of `GmailConnector.sync`, with `folders` in place of `query` and `labels`.
+`list_sync_jobs`, `get_sync_job` and `delete_sync_job` work as for Gmail; a job's `labels` hold its folder ids.
+
+### Configure a sync job with the CLI
+
+```bash
+hops datasource labels support_outlook
+hops datasource sync support_outlook --label <folder id> --start-date 2026-01-01 --schedule hourly
+hops datasource sync-jobs support_outlook
+```
+
+`hops datasource labels` lists the ids and paths of the mailbox's folders, and `--label` takes a folder id.
+`--query` is refused for an Outlook data source.
+
+!!! api "API reference"
+
+    - <code class="doc-symbol doc-symbol-class"></code> <autoref identifier="hsfs.storage_connector.OutlookConnector" optional><code>OutlookConnector</code></autoref>
+        - <code class="doc-symbol doc-symbol-method"></code> <autoref identifier="hsfs.storage_connector.OutlookConnector.get_access_token" optional><code>get_access_token</code></autoref>
+        - <code class="doc-symbol doc-symbol-method"></code> <autoref identifier="hsfs.storage_connector.OutlookConnector.get_folders" optional><code>get_folders</code></autoref>
+        - <code class="doc-symbol doc-symbol-method"></code> <autoref identifier="hsfs.storage_connector.OutlookConnector.sync" optional><code>sync</code></autoref>
+    - <code class="doc-symbol doc-symbol-class"></code> <autoref identifier="hsfs.storage_connector.MailSyncJobConfig" optional><code>MailSyncJobConfig</code></autoref>
+
+    <a class="hops-api-cta" href="../../../../../python-api/hopsworks/">Browse the full Python API :material-arrow-right:</a>
+
+## Read the emails
+
+Read the feature group like any other, or search it with DuckDB in a terminal as described for [Gmail][data-source-gmail].
+The `hops-email-search` skill of the coding agents in a terminal works on both.
+
+## Remove the copied emails
+
+The feature group and the attachment files are a copy of the mailbox that Hopsworks keeps until you remove it:
+
+- An incremental run never removes a row, so a message deleted in Outlook stays until a full load.
+- A full load removes the rows and attachments of the messages it no longer finds, but the Delta table keeps its earlier versions, with those rows, until it is vacuumed.
+- Deleting the data source or its sync jobs leaves the feature group and the attachment files in place.
+- Sharing the project's feature store with another project shares the feature group, and so the emails, with that project's members.
+
+To remove a mailbox's copy completely, delete the sync job, then the feature group, which removes its Delta table with all its versions, then the attachments directory:
+
+```python
+import hopsworks
+
+
+project = hopsworks.login()
+fs = project.get_feature_store()
+
+outlook = fs.get_data_source("support_outlook").storage_connector
+job = outlook.get_sync_job("support_outlook_outlook_sync")
+outlook.delete_sync_job(job.job_name)
+fs.get_feature_group(job.feature_group_name, version=1).delete()
+project.get_dataset_api().remove(job.path)
+```
+
+To remove only the messages deleted in Outlook, run a full load; its earlier versions go when you vacuum the table with `delta_vacuum` once the retention period, 7 days by default, has passed.
+
+## Delete the data source
+
+Deleting an Outlook data source deletes its sync jobs and their schedules.
+The feature groups and the attachment files stay; see [Remove the copied emails](#remove-the-copied-emails).
 
 ================================================================================
 # SharePoint
@@ -18452,7 +19209,7 @@ The `INFERENCE / AGENTS / APPS` environments can be used in a deployment using a
 - `tensorflow-inference-pipeline` to load and serve TensorFlow models
 - `torch-inference-pipeline` to load and serve PyTorch models
 - `pandas-inference-pipeline` to load and serve XGBoost, Catboost and Sklearn models
-- `python-agent-pipeline` to build Python agents, bundling FastAPI, LlamaIndex and OpenTelemetry
+- `python-agent-pipeline` to build Python agents, bundling FastAPI, LangChain and LangGraph, Deep Agents, LlamaIndex, the OpenAI Agents SDK, the Claude Agent SDK and its predecessor the Claude Code SDK, the Tavily search client and OpenTelemetry
 - `python-app-pipeline` to build interactive applications with Streamlit
 - `vllm-inference-pipeline` to load and serve LLMs with vLLM inference engine
 - `minimal-inference-pipeline` to install your own custom framework, contains a minimal set of dependencies
@@ -19588,7 +20345,8 @@ The session comes with tooling preinstalled:
 
 - `hops` initializes the Hopsworks CLI, already pointed at your project.
 - `git` works against your configured [Git providers][how-to-configure-a-git-provider]; upload an SSH key to `~/.ssh` or add a GitHub access token in Account Settings.
-- `claude` starts a Claude Code session and `codex` starts an OpenAI Codex CLI session; their logins persist in HopsFS across sessions.
+- `claude`, `codex`, `opencode` and `copilot` start a Claude Code, OpenAI Codex CLI, OpenCode or GitHub Copilot CLI session, and in the Python terminal `pi` and `hermes` start a pi or Hermes Agent session.
+  Each one has the Hopsworks skills, reads the instructions Hopsworks writes into `AGENTS.md` in your home directory when started there, and keeps its login and sessions in HopsFS across sessions.
 - Right-click opens a menu to split the terminal horizontally or vertically (tmux).
 - Selecting text with the left mouse button copies it to your clipboard.
 
@@ -19619,7 +20377,7 @@ A Spark terminal has no GPUs.
 
 ## LLM Provider
 
-**LLM Provider**, under **Start**, shows the provider the terminal's coding agents use; **Subscription**, the default, leaves `claude`, `codex`, `copilot` and `opencode` on their own logins.
+**LLM Provider**, under **Start**, shows the provider the terminal's coding agents use; **Subscription**, the default, leaves `claude`, `codex`, `copilot`, `opencode`, `pi` and `hermes` on their own logins.
 Clicking it shows the providers as cards, each saying whether its key is saved: Kimi, DeepMind, Berget, Mistral, GLM, Anthropic, OpenAI, Meta and OpenRouter.
 For a provider, pick a model or type a model id, enter its API key and press **Save key**, then **Test**, which checks the key against the provider's model list without spending tokens and says whether the model is listed.
 
@@ -19629,6 +20387,12 @@ When the terminal starts, the key is set as the provider's own variable (for exa
 - `codex` and `opencode` use the provider and model: every provider is written into `~/.codex/config.toml` as `model_providers.hops-<provider>`, so switching needs only that provider's key, and codex gets the model settings the provider's guide gives, such as Meta's and Kimi's 1M-token context window.
 - `claude` uses them for providers with an Anthropic-compatible API (Kimi, GLM, Anthropic, Meta and OpenRouter), through `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL` and the model variables each provider's Claude Code guide sets (for Kimi, `kimi-k3[1m]` with its 1M-token context and `kimi-k2.7-code` for the background tier); for the others it keeps its own login.
   An `env` block in `~/.claude/settings.json` overrides these, so the terminal warns at start when it sets any of them.
+- `pi` and `hermes`, which only the Python terminal has, take them as follows.
+  `pi` uses the provider and model: the provider is written into `~/.pi/agent/models.json` as `hops-<provider>`, and `pi` starts on it unless you pass `--model`, `--provider` or `--models`.
+  `hermes` uses the provider and model, set in the managed configuration Hermes Agent reads on top of `~/.hermes/config.yaml`.
+  Every provider is there as `custom:hops-<provider>`, so `/model <model> --provider custom:hops-<provider>` switches a session to another provider whose key the terminal has.
+  Hermes Agent runs its sessions in a background gateway that the first `hermes` starts, with the environment of that shell, so after exporting another provider's key run `hermes gateway stop` before the next `hermes`.
+  While a provider is chosen, `hermes model` cannot save a different default model, because the managed configuration sets it; pick **Subscription** to choose the model in Hermes Agent instead.
 - `copilot` keeps its GitHub login.
 
 A provider with no saved key disables **Start** until you save one or pick **Subscription**.
@@ -32296,6 +33060,7 @@ Editing a published suite means a new version, with `evals.suites.new_version(..
 | `llm_judge`, `tool_arguments_judge`, `pairwise` | A model's judgement against a rubric, or against a reference answer |
 | `sql_state` | The state of the world after the agent acted |
 | `human_review` | Nothing automatic: it defers to a person |
+| `python` | Whatever the checks the project wrote decide: a file is named and every function in it declared with `@check` runs; see [Writing your own checks](#writing-your-own-checks) |
 
 A check that needs something from the task, such as the answer a `contains` looks for or the rubric a judge grades against, refuses the task when it joins the suite rather than failing silently at run time.
 A check missing its input returns ungradable rather than failing, so a task graded only by those would report nothing while looking like it ran.
@@ -32310,6 +33075,87 @@ template = evals.evaluators.save(
 ```
 
 Applying a saved evaluator copies its checks into the suite, so a published suite keeps meaning what it meant even if the library entry changes later.
+
+### Writing your own checks
+
+When no built-in check says what correct means for your agent, write one.
+A `python` check is a function in a file the project owns, declared with the `@check` decorator, and the evaluation job grades with it the way it grades with a built-in check: same results rows, same pass rates, same gates and monitors.
+
+```python
+# evaluation/checks/pricing.py
+from hopsworks_agents.eval.checks import CheckContext, CheckResult, check, ungradable
+
+
+@check(needs_trace=True, description="The quoted price equals the catalogue price")
+def price_matches_catalogue(ctx: CheckContext, tolerance: float = 0.01):
+    lookups = ctx.calls("lookup_product")
+    if not lookups:
+        return ungradable("the agent never looked the product up")
+    listed = float(lookups[-1].result_json["price"])
+    quoted = float(ctx.answer.split()[-1])
+    ok = abs(quoted - listed) <= tolerance
+    return CheckResult(
+        passed=ok,
+        score=1.0 if ok else 0.0,
+        reason="" if ok else f"quoted {quoted}, catalogue says {listed}",
+        assertions={"quoted": quoted, "listed": listed},
+    )
+```
+
+The function receives a `CheckContext`: the question, the agent's answer, the task's expectation for this check, the trace's tool calls in order with their arguments and results, and the trial's and task's details.
+Its keyword parameters are the check's settings, and their defaults are what a suite gets when it sets none.
+It returns `True` or `False`, a score from 0 to 1, a `CheckResult`, or `ungradable(reason)` when its precondition did not hold.
+A bare score passes at `pass_score`, which defaults to 1.0; set it per check in the row's `params` (`{"scored": {"pass_score": 0.8}}`), where the job reads it, and it reaches the function only when the function declares a `pass_score` parameter.
+`@check` is used bare, with a name (`@check("price_ok")`) or with settings: `needs_trace` defaults to `True`, which reports the check ungradable when no trace arrived; `reads_expectation` defaults to `False`; `timeout_s` defaults to 30 seconds and is capped at 600.
+A check that raises, times out or returns something else makes that check's result ungradable with the reason on the row.
+It never passes and never counts against the agent, because a broken check is the harness failing; the trial keeps the verdicts of the other checks.
+A source that fails to load, or an `only` name the source does not declare, makes the trial `EVALUATOR_ERROR` with the reason on its rows.
+
+Try it before a run does, on inputs you choose or on a real conversation:
+
+```python
+from hopsworks_agents.eval.checks import run_check
+
+run_check(price_matches_catalogue, answer="It costs 19.99",
+          tools=[{"name": "lookup_product", "result": '{"price": 19.99}'}])
+run_check(price_matches_catalogue, trace=agent.trace("4bf1..."))
+evals.runs.replay(run, price_matches_catalogue)   # last night's trials, re-graded, nothing written
+```
+
+Then put the file where the job reads it.
+Uploading it registers one library entry for the file, and a suite names the file as one row: every check it declares runs, each reported under its own name.
+When two rows of one suite declare the same name, the row later in the suite reports it as `<row>/<check>`.
+A `.py` file or a package directory with `__init__.py` can be named; a package is scanned module by module and is held to 2000 files and 20 MB.
+The file's directory is on the path while it is imported, so a helper beside it imports; the job reads project files off the HopsFS mount.
+
+```python
+evals.checks.upload("evaluation/checks/pricing.py", tags=[agent.name])
+```
+
+```python
+check("python", "pricing", file="Resources/agent_evals/checks/pricing.py",
+      params={"price_matches_catalogue": {"tolerance": 0.005}})
+```
+
+`only` and `exclude` narrow a row to some of the checks a file declares; `params` is keyed by check.
+Whether a check reads the trace, reads the task's expectation, its timeout and its description are stated on the decorator and nowhere else: Hopsworks scans the file when the row is saved and keeps what it declares on the row, so the task form asks for what each check expects, a monitor refuses a file that declares a check reading the expectation, and a name in `only`, `exclude` or `params` the file does not declare is refused with the names it does.
+
+Checks can also live in a git repository, including the agent's own.
+`git={"url": ..., "ref": ...}` with `path` names a file in a repository the evaluation job clones with the git providers of the account the job runs as; the url is https and carries no credentials, and an optional `commit` pins the row from the start.
+`git="deployment"` names a file in the evaluated deployment's repository at the commit it is running, so the checks version with the agent.
+`evals.checks.register(path, git=...)` saves one library entry from a local clone without uploading anything.
+A `module` names a module installed in the agent-pipeline environment the job runs in.
+
+A published suite is frozen, and that includes a check's code where the code has a version to freeze.
+A project file is not copied: the job reads it off the project on every run, published or not, and each result records the hash of every file the import read (the entry and the helpers beside it, as `source.files`), so the file stays the project's to edit and a run still says which text graded it.
+A git check is pinned by the job on the first run of the published version and read from that copy afterwards; a repository too large to copy is pinned by its commit, which later runs clone at.
+`git="deployment"` is deliberately not pinned, and a module's version is its environment.
+Every result's assertions carry the `source` the check was graded with (`origin`, `sha256`, `files`, `commit`, `pinned`), so a run can always say which code decided it.
+The keys `source`, `row`, `check` and `skipped` belong to the runner; a check that sets them keeps its values under `check_reserved`.
+
+A check that does not read the task's expectation can grade live traffic in a monitor, like any other expectation-free check.
+One declared with `reads_expectation=True` is refused there for a project file, since production traffic carries no task; for a git or module source, which Hopsworks cannot scan, such a check is ungradable on each live trial instead.
+Check code runs in the evaluation job as the user who started the run, with the job's environment and credentials: whoever can write the file or push to the repository can run code there.
 
 ### How a judge decides pass or fail
 
@@ -34352,6 +35198,8 @@ See [Cluster Configuration][cluster-configuration] for how to view and change th
 | `enable_feature_monitoring` | Boolean | `false` | Settings.java |
 | `enable_gcs_storage_connectors` | Boolean | `false` | Settings.java |
 | `enable_glue_storage_connectors` | Boolean | `true` | Settings.java |
+| `enable_gmail_storage_connectors` | Boolean | `true` | Settings.java |
+| `enable_outlook_storage_connectors` | Boolean | `true` | Settings.java |
 | `enable_google_sheets_storage_connectors` | Boolean | `true` | Settings.java |
 | `enable_hopsfsmount_page_cache_in_jobs` | Boolean | `true` | Settings.java |
 | `enable_hopsfsmount_page_cache_in_jupyter` | Boolean | `false` | Settings.java |
@@ -35387,6 +36235,33 @@ Kafka is used within Hopsworks to enable users to write data to the feature stor
 If a user creates a feature group with the stream APIs enabled, then a Kafka topic will be created for that feature group.
 By default, a project can have up to 100 Kafka topics.
 Administrators can increase the number of Kafka topics a project is allowed to create by increasing the quota in the project admin UI.
+
+### OpenSearch
+
+A project stores its vector (embedding) indices, and any indices its data owners create, in the cluster's OpenSearch.
+Three quotas limit what it can store there:
+
+- **Max vector index size**: the size, in MB of primary store, each of the project's vector indices may reach.
+- **Max OpenSearch index size**: the same for each index the project creates itself, named after the project.
+- **Max number of vector indexes**: how many vector indices the project may have.
+  Creating a feature group that would need another one fails with an error naming the limit.
+
+An index that reaches its size limit turns read-only: rows written to it afterwards fail, while reads keep working.
+OpenSearch checks the size every five minutes or so, so an index can grow past the limit by what is written in between.
+
+All three quotas are unlimited by default.
+Administrators can change the defaults on the _Quotas and Rate Limits_ page of the cluster settings, or by setting the following configuration in the [Configuration](../admin/variables.md) UI and/or the cluster definition:
+
+```yaml
+hopsworks:
+    opensearch_default_max_vector_index_size_mb: [size limit of each vector index in MB, -1 for unlimited]
+    opensearch_default_max_index_size_mb: [size limit of each other project index in MB, -1 for unlimited]
+    opensearch_default_max_num_embedding_indices: [number of vector indices, -1 for unlimited]
+```
+
+Unlike the storage quotas, the defaults apply to every project that has no limit of its own, including existing ones.
+An administrator can give a project its own limits in this UI, or put it back on the defaults.
+Raising a project's index size limit makes its read-only indices writable again within a few minutes.
 
 ## Force deleting a project
 
@@ -36816,6 +37691,158 @@ The CRDs stay, because other software on the cluster may use them.
     ```
 
 ================================================================================
+# Model Serving Ingress Gateway
+Source: https://docs.hopsworks.ai/latest/setup_installation/admin/model_serving_gateway/
+
+# Model Serving Ingress Gateway { #model-serving-ingress-gateway }
+
+## Introduction
+
+Inference requests to KServe model deployments enter through the Istio ingress gateway, the `istio-ingressgateway` Service in the Hopsworks namespace.
+It routes on the path: `/v1/<project namespace>/<deployment>/...` reaches that deployment.
+By default the chart creates the Service with three node ports, 32080 (HTTP), 32443 (HTTPS) and 32021 (status):
+
+- as a `NodePort` Service when the chart's external load balancers are unmanaged;
+- as a `LoadBalancer` Service otherwise.
+
+`kserve.istio.gateways.ingress.serviceType` sets the type instead.
+Leave it empty to keep the default.
+
+| `serviceType` | Service type | Node ports |
+| --- | --- | --- |
+| `""` (default) | `NodePort` or `LoadBalancer`, as above | 32080, 32443, 32021 |
+| `ClusterIP` | `ClusterIP` | none |
+| `NodePort` | `NodePort` | 32080, 32443, 32021 |
+| `LoadBalancer` | `LoadBalancer` | 32080, 32443, 32021 |
+
+The values are listed in [KServe values][helm-values-kserve].
+
+## Where clients send inference requests { #model-serving-gateway-endpoints }
+
+The Hopsworks backend tells clients where the gateway is:
+
+- `KUBE_CLUSTER`: the gateway's ClusterIP, for clients inside the cluster.
+- `LOAD_BALANCER`: the host in `kube_knative_lb_domain` on HTTPS port 443 when that variable is set, otherwise the address of the gateway's load balancer, if it has one.
+
+The Python client in a cluster pod calls the gateway directly.
+Outside the cluster it calls the `LOAD_BALANCER` endpoint.
+Without one, it sends requests to REST deployments through the Hopsworks REST API, which forwards them to the gateway.
+The REST API does not forward gRPC, so a gRPC deployment can be called from outside the cluster only through a `LOAD_BALANCER` endpoint that carries gRPC to the gateway.
+
+The client reads the endpoints once, on its first inference request, and keeps them until the Python process ends.
+
+## Namespaces without NodePort or LoadBalancer Services { #model-serving-gateway-clusterip }
+
+A namespace whose ResourceQuota sets `services.nodeports: 0` and `services.loadbalancers: 0` rejects the default gateway Service, and the install fails in the `istioctl-install-job` hook:
+
+```text
+services "istio-ingressgateway" is forbidden: exceeded quota: ..., requested: services.loadbalancers=1,services.nodeports=3, ...
+```
+
+Install with a ClusterIP gateway:
+
+```yaml
+kserve:
+  istio:
+    gateways:
+      ingress:
+        serviceType: ClusterIP
+```
+
+The other Services the chart creates must not need node ports or load balancers either:
+
+- The bundled container registry is a `NodePort` Service, because the kubelet pulls from it through the node port.
+  Use a managed registry, `global._hopsworks.managedDockerRegistery`.
+- The external load balancers of RonDB, Kafka, OpenSearch, HopsFS, Hive Metastore, Trino and Arrow Flight are `LoadBalancer` Services.
+  Turn them off, which also removes access to these services from outside the cluster:
+
+```yaml
+global:
+  _hopsworks:
+    externalLoadBalancers:
+      enabled: false
+rondb:
+  rondb:
+    meta:
+      mysqld:
+        externalLoadBalancer:
+          enabled: false
+      rdrs:
+        externalLoadBalancer:
+          enabled: false
+```
+
+The RonDB lines are needed because the chart's root values set these two from `global._hopsworks.externalLoadBalancers.enabled` when the file is read, so overriding the global value later does not reach them.
+
+With a ClusterIP gateway the backend advertises only `KUBE_CLUSTER`.
+Clients outside the cluster send requests to REST deployments through the Hopsworks REST API, unless an address in front of the gateway is set up, as described below.
+gRPC deployments cannot be called from outside the cluster without such an address.
+
+### Unmanaged load balancers on AWS { #model-serving-gateway-aws }
+
+With unmanaged load balancers on AWS, the chart binds the gateway to the target groups in `global.unmanagedLoadBalancers.istio`.
+Their targets reach the gateway through its node ports, so the chart refuses `serviceType: ClusterIP` there:
+
+```text
+istio.gateways.ingress.serviceType ClusterIP cannot be used with unmanaged load balancers on AWS: the istio target groups reach the ingress gateway through its node ports
+```
+
+## Direct inference from outside the cluster { #model-serving-gateway-external-host }
+
+To let clients outside the cluster call the gateway directly, put a host in front of it and set `kube_knative_lb_domain` to that host.
+The host must serve HTTPS on port 443 and forward to the gateway's `http2` port (80) with the path unchanged.
+
+On OpenShift, an edge Route does this for REST deployments:
+
+```bash
+oc -n <namespace> create route edge istio-inference \
+  --service=istio-ingressgateway \
+  --port=http2 \
+  --hostname=inference-hopsworks.apps.<cluster domain>
+```
+
+The Route carries HTTP/1.1 to the gateway, since the gateway's ports declare no `h2c` application protocol, so it does not carry gRPC.
+
+Check it with a REST deployment and an API key with the `SERVING` scope.
+The model name in the path is the deployment name:
+
+```bash
+curl -H "Authorization: ApiKey <api key>" \
+  -H "Content-Type: application/json" \
+  -d '{"instances": [[5.1, 3.5, 1.4, 0.2]]}' \
+  https://inference-hopsworks.apps.<cluster domain>/v1/<project namespace>/<deployment>/v1/models/<deployment>:predict
+```
+
+Then set `kube_knative_lb_domain` to the host, without a scheme, on the configuration page described in [Cluster Configuration][cluster-configuration].
+The backend advertises the host as the `LOAD_BALANCER` endpoint on HTTPS 443 at once, without a restart.
+Python clients started afterwards call it directly; running ones keep the endpoints they read first.
+
+## Changing the type of an existing gateway { #model-serving-gateway-change }
+
+`helm upgrade` with a new `serviceType` changes the existing Service in place, in the `istioctl-install-job` hook.
+The ClusterIP stays the same and the gateway pods are not restarted, so running deployments keep serving without a redeploy.
+
+After a switch away from `LoadBalancer`, clients outside the cluster keep calling the old load balancer address until three things are done, in this order:
+
+1. If `kube_knative_lb_domain` names the old load balancer, point it at the new host in front of the gateway, or clear it to use the REST API.
+   The backend advertises this variable whatever the Service type is.
+2. Restart `hopsworks-instance`.
+   The backend keeps the gateway's addresses in memory until it restarts, so without a restart it keeps advertising the old load balancer address.
+   Read the replica count first, since the Deployment returns to it:
+
+    ```bash
+    REPLICAS=$(kubectl -n <namespace> get deployment hopsworks-instance -o jsonpath='{.spec.replicas}')
+    kubectl -n <namespace> scale deployment hopsworks-instance --replicas=0
+    kubectl -n <namespace> wait pod -l app=hopsworks-instance --for=delete --timeout=10m
+    kubectl -n <namespace> scale deployment hopsworks-instance --replicas="$REPLICAS"
+    ```
+
+3. Restart the Python processes that already sent inference requests, such as notebook kernels and long-running jobs.
+   The client keeps the endpoints it read first until its process ends.
+
+A ResourceQuota rejects only creates and updates that raise its usage, and the switch to `ClusterIP` lowers it, so the quota can be added before or after the upgrade.
+
+================================================================================
 # Kafka Quotas
 Source: https://docs.hopsworks.ai/latest/setup_installation/admin/kafka_quotas/
 
@@ -36884,7 +37911,7 @@ That is usually what you want for the platform's own clients, such as OnlineFS a
 
 Optionally, set a default for the users without a quota under `quotas.kafka.*`.
 The Strimzi Cluster Operator writes and reconciles it as the default user quota, and a KafkaUser's own quota overrides it.
-Size it so that the platform's own clients still work: the default applies to internal users too, and this plugin has no way to exclude them, as [the Strimzi documentation](https://strimzi.io/docs/operators/1.3.0/configuring.html#type-QuotasPluginKafka-reference) warns.
+Size it so that the platform's own clients still work: the default applies to internal users too, and this plugin has no way to exclude them, as [the Strimzi documentation](https://strimzi.io/docs/operators/1.3.1/configuring.html#type-QuotasPluginKafka-reference) warns.
 
 ## Cluster-wide limits and the disk guard { #kafka-quotas-cluster-wide }
 
@@ -37455,7 +38482,7 @@ The commands assume Hopsworks is installed in the `hopsworks` namespace.
 | ------- | ---------- | ----------------- |
 | [5.0.x to 5.1.x][upgrade-50-to-51] | 1.3.x to 2.19.x | Kubernetes 1.34 or later before the upgrade, a first Helm 4 upgrade, and from 5.0.13 or earlier to 5.1.2 or later [the Trino query history][upgrade-trino-query-history]. |
 | [5.1.x to 5.2.x][upgrade-51-to-52] | 2.19.x to 3.8.0: upgrade to 5.2.1 or later | The index pass, Kafka moves to KRaft, KEDA, Kubernetes 1.37 only afterwards, Trino, from 5.2.2 [OnlineFS and the schema migrations][upgrade-changes-from-522], and from 5.2.3 with your own image registry [the Envoy image of Python apps][upgrade-changes-from-523]. |
-| [5.2.x to 5.3.x][upgrade-52-to-53] | stays on 3.8.0 | [Strimzi 1.3][upgrade-strimzi-13] with central before its satellites, ICEBERG feature groups in Trino, the Filebeat registry, the memory of the OTLP sidecar of agent deployments, [Envoy Gateway][upgrade-envoy-gateway] when turned on, with an external Kafka [the topics Hopsworks creates and deletes on it][upgrade-byok-topics], [notification topics and shared feature stores][upgrade-notification-topics], from 5.2.0 [the subset shares in Trino][upgrade-trino-subset-shares] and the OpenSearch security configuration, and from 5.2.0 or 5.2.1 [OnlineFS and the schema migrations][upgrade-changes-from-522]. |
+| [5.2.x to 5.3.x][upgrade-52-to-53] | stays on 3.8.0 | [Strimzi 1.3][upgrade-strimzi-13] with central before its satellites, ICEBERG feature groups in Trino, the Filebeat registry, with your own pipelines, outputs or plugins [Logstash 9][upgrade-logstash-9], the memory of the OTLP sidecar of agent deployments, [Envoy Gateway][upgrade-envoy-gateway] when turned on, with an external Kafka [the topics Hopsworks creates and deletes on it][upgrade-byok-topics], [notification topics and shared feature stores][upgrade-notification-topics], from 5.2.0 [the subset shares in Trino][upgrade-trino-subset-shares] and the OpenSearch security configuration, and from 5.2.0 or 5.2.1 [OnlineFS and the schema migrations][upgrade-changes-from-522]. |
 
 ## Before every upgrade { #upgrade-before-every-upgrade }
 
@@ -37630,24 +38657,24 @@ An upgrade from 5.2.0 also crosses two changes of 5.2.1, described under 5.1.x t
 
 ### Strimzi 1.3 { #upgrade-strimzi-13 }
 
-From the 5.2.x patch release that uses Strimzi 1.3, and in 5.3, the chart deploys Strimzi 1.3.0 in place of 1.2.0, and Kafka stays on 4.3.1.
+From the 5.2.x patch release that uses Strimzi 1.3, and in 5.3, the chart deploys Strimzi 1.3.1 in place of 1.2.0, and Kafka stays on 4.3.1.
 An upgrade from a release that already uses Strimzi 1.3 crosses none of this.
 
 - **Upgrade central before its satellites**, the reverse of the order from 5.1.x to 5.2.x.
-  A satellite runs on central's operator, and the 1.2.0 operator would replace the satellite's controller onto the 1.3.0 image without the configuration that image reads, which leaves the satellite's Kafka down until central is upgraded.
+  A satellite runs on central's operator, and the 1.2.0 operator would replace the satellite's controller onto the 1.3.1 image without the configuration that image reads, which leaves the satellite's Kafka down until central is upgraded.
   The satellite's upgrade therefore refuses to start while its Kafka was last reconciled by an older 1.x operator.
-  Upgrade central, wait until the satellite's Kafka reports the 1.3.0 operator, then upgrade the satellite:
+  Upgrade central, wait until the satellite's Kafka reports the 1.3.1 operator, then upgrade the satellite:
 
     ```sh
     kubectl get kafka <cluster> -n <satellite-namespace> -o jsonpath='{.status.operatorLastSuccessfulVersion}'
     ```
 
-  Until its own upgrade, the satellite keeps its pods on the old image under the 1.3.0 operator, and that upgrade replaces each of them once.
+  Until its own upgrade, the satellite keeps its pods on the old image under the 1.3.1 operator, and that upgrade replaces each of them once.
 - **No step before `helm upgrade`.**
-  The `strimzi-crd-upgrade` hook applies the Strimzi 1.3.0 CRDs before the operator is replaced.
+  The `strimzi-crd-upgrade` hook applies the Strimzi 1.3.1 CRDs before the operator is replaced.
 - **The brokers and controllers are replaced once**, by the new operator, for the new image.
   The chart stops the outgoing operator before it starts the new one, through `kafka.strimzi-kafka-operator.deploymentStrategy`, so that the 1.2.0 operator does not act on the new image.
-  A pod the 1.2.0 operator replaces onto the 1.3.0 image lacks the configuration that image reads, and restarts until the new operator takes over.
+  A pod the 1.2.0 operator replaces onto the 1.3.1 image lacks the configuration that image reads, and restarts until the new operator takes over.
   It then recovers on its own, which can take a few minutes, because Kubernetes waits up to five minutes between restarts of a failing container.
   The setting makes that unlikely rather than impossible: nothing waits for the old operator to exit.
   If your values set `kafka.strimzi-kafka-operator.deploymentStrategy.type: Recreate`, also set `rollingUpdate: null` there, or the merged strategy is rejected.
@@ -37657,7 +38684,7 @@ An upgrade from a release that already uses Strimzi 1.3 crosses none of this.
   Strimzi 1.3 turns its `UseBackgroundPodDeletion` feature gate on by default, so that CNI plugins which remove a pod's network endpoints when its object is deleted, such as Cilium, no longer cut a broker off before it has shut down.
   To keep the earlier foreground deletion, set `kafka.strimzi-kafka-operator.featureGates: "-UseBackgroundPodDeletion"`.
 - **Under ArgoCD, the `ignoreDifferences` entry for the Kafka CRD is no longer needed.**
-  Strimzi 1.3.0's Kafka CRD no longer has the empty map that the entry in [Under ArgoCD][kafka4-argocd] ignores, and the entry matches nothing on it, so it can stay.
+  Strimzi 1.3.1's Kafka CRD no longer has the empty map that the entry in [Under ArgoCD][kafka4-argocd] ignores, and the entry matches nothing on it, so it can stay.
 
 ### ICEBERG feature groups in Trino { #upgrade-iceberg-trino }
 
@@ -37704,6 +38731,23 @@ On the upgrade to 5.3:
   Later restarts and upgrades resume from the registry.
 - Leave the existing contents of `/var/lib/filebeat-data` in place.
   Nothing in the chart reads them, and they may belong to another Filebeat on the node.
+
+### Logstash 9 { #upgrade-logstash-9 }
+
+In 5.3, and from the 5.2.x patch release that ships it, Logstash moves from 7.17 to 9.5.
+The chart's own pipelines need nothing, and documents keep their field names, because the chart sets `pipeline.ecs_compatibility: disabled`.
+Pipelines, outputs and plugins you added through `logstash.extraPipelines`, `logstash.additional_audit_outputs` or `logstash.plugins` need a check before the upgrade:
+
+- **Rename the TLS settings of `elasticsearch`, `http` and `tcp` outputs in the same upgrade.**
+  The output plugins move up a major version: `elasticsearch` 11 to 12, `http` 5 to 6, `tcp` 6 to 7 and `opensearch` 1 to 2.
+  The new `elasticsearch`, `http` and `tcp` outputs refuse their old SSL settings, such as `cacert`, `ssl` and `ssl_certificate_verification` on `elasticsearch`, `cacert`, `client_cert`, `client_key`, `keystore` and `truststore` on `http`, and `ssl_enable`, `ssl_cert`, `ssl_cacert` and `ssl_verify` on `tcp`.
+  The 7.17 versions do not know the replacement names, such as `ssl_enabled` and `ssl_certificate_authorities`, so no TLS setting works on both versions, and the values of the upgrade itself must carry the new names.
+  Each plugin's page in the [Logstash plugin reference](https://www.elastic.co/docs/reference/logstash/plugins) lists them.
+- **A pipeline that fails to start stops all log shipping.**
+  Logstash keeps running the other pipelines, but the routing pipeline waits on every event for the one that did not start, so service, project and audit logs all stop while the Logstash pod stays ready.
+  After the upgrade, look for `is obsolete and is no longer available` in the Logstash log.
+- **The kafka integration, the `azure_event_hubs` input and the `webhdfs` output are no longer in the image.**
+  A pipeline that uses one of them needs it in `logstash.plugins`, which installs it when the Logstash pod starts, so it needs access to `rubygems.org` and cannot run on an airgapped cluster.
 
 ### Agent deployments reserve 2 GiB for their OTLP sidecar { #upgrade-agent-otlp-sidecar }
 
@@ -38655,7 +39699,7 @@ The `strimzi-crd-upgrade` hook therefore stops the sync after the conversion, an
     Upstream's 1.2.0 Kafka CRD declares an empty `properties: {}` map under `status.clusterSecurity`, and the apiserver drops an empty map when it stores a CRD, so the live object never matches the render.
     Not every Application compares the two in a way that notices; one that does never reaches Synced without the entry, and selfHeal re-applies that one CRD every five minutes.
     The entry matches nothing on 5.1.x, so you can add it before the upgrade.
-    Strimzi 1.3.0's Kafka CRD has no such map, so a release with Strimzi 1.3 does not need the entry, and it can stay because it matches nothing there either.
+    Strimzi 1.3.1's Kafka CRD has no such map, so a release with Strimzi 1.3 does not need the entry, and it can stay because it matches nothing there either.
     `helm upgrade` is not affected.
 
     ```yaml
@@ -45057,6 +46101,11 @@ Source: https://docs.hopsworks.ai/latest/python-api/hsfs/storage_connector/
       heading_level: 2
       show_root_heading: true
 
+::: hsfs.storage_connector.GmailConnector
+    options:
+      heading_level: 2
+      show_root_heading: true
+
 ::: hsfs.storage_connector.GoogleSheetsConnector
     options:
       heading_level: 2
@@ -45082,7 +46131,22 @@ Source: https://docs.hopsworks.ai/latest/python-api/hsfs/storage_connector/
       heading_level: 2
       show_root_heading: true
 
+::: hsfs.storage_connector.MailAccessToken
+    options:
+      heading_level: 2
+      show_root_heading: true
+
+::: hsfs.storage_connector.MailSyncJobConfig
+    options:
+      heading_level: 2
+      show_root_heading: true
+
 ::: hsfs.storage_connector.MongoDBConnector
+    options:
+      heading_level: 2
+      show_root_heading: true
+
+::: hsfs.storage_connector.OutlookConnector
     options:
       heading_level: 2
       show_root_heading: true
@@ -47208,6 +48272,7 @@ When you upgrade, read the breaking changes of every release between yours and t
 
 | Helm chart | Released | Python client |
 | ---------- | -------- | ------------- |
+| [5.2.4][hopsworks-5-2-4] | 2026-11-05 | [5.2.3](https://github.com/logicalclocks/hopsworks-api/releases/tag/5.2.3) |
 | [5.2.3][hopsworks-5-2-3] | 2026-10-29 | [5.2.2](https://github.com/logicalclocks/hopsworks-api/releases/tag/5.2.2) |
 | [5.2.2][hopsworks-5-2-2] | 2026-10-28 | [5.2.2](https://github.com/logicalclocks/hopsworks-api/releases/tag/5.2.2) |
 | [5.2.1][hopsworks-5-2-1] | 2026-10-16 | [5.2.1](https://github.com/logicalclocks/hopsworks-api/releases/tag/5.2.1) |
@@ -47239,6 +48304,80 @@ Source: https://docs.hopsworks.ai/latest/releases/5.2/
 # Release notes { #hopsworks-5-2 }
 
 The releases of Hopsworks 5.2, newest first.
+
+## 5.2.4 { #hopsworks-5-2-4 }
+
+Helm chart 5.2.4 · Released on 2026-11-05 · Changes since [5.2.3][hopsworks-5-2-3] · Python client [5.2.3](https://github.com/logicalclocks/hopsworks-api/releases/tag/5.2.3)
+
+### What's changed
+
+- [API] [FRONTEND] Addressed vulnerabilities in projects, data sources, secrets, training datasets and Jupyter.
+- [API] [FRONTEND] Fixed a scheduled job that was run by hand twice in one schedule interval while its scheduled run waited to start, such as for an earlier run to finish, never running on its schedule again, which could also keep the schedules of other jobs from running.
+- [API] [FRONTEND] Fixed an incremental ingestion job on a cluster with more than one SQL node sometimes resuming from an earlier run's cursor, or from the beginning, and appending rows it had already ingested a second time.
+- [API] [FRONTEND] Fixed ingestion jobs of CRM data sources dropping, in every table but the data source's first, the values whose type differs from the first values of the run, such as `0.75` after `2` in a `double` feature.
+- [API] [FRONTEND] Fixed a read from a SQL Server data source through ArrowFlight hanging when its login got no answer, after which every later read through that ArrowFlight server timed out; such a login now fails after its timeout.
+- [API] Fixed the Python client writing the rows it meant only for the offline feature store into the online feature store of a 5.0 satellite cluster, and its filtered kNN searches failing on a 5.0 satellite's OpenSearch.
+- [API] [FRONTEND] [HELM] Fixed model deployments never becoming ready, with an x509 error, when the image registry has an organisation path or a port.
+- [API] [FRONTEND] Fixed ingestion jobs and schema fetches of Shopify data sources failing with `ModuleNotFoundError`.
+- [API] [FRONTEND] [HELM] Added Gmail data sources, whose sync jobs copy a Gmail or Google Workspace mailbox into a Delta feature group on demand, hourly or daily, with its attachments as files, for search with DuckDB in web terminals, also with `GmailConnector.sync` in the Python client and `hops datasource sync`; `hopsworks.variables.enable_gmail_storage_connectors` turns them off ([Gmail][docs-ds-gmail]).
+- [API] [FRONTEND] [HELM] Added Outlook data sources, for Microsoft 365 and Outlook.com mailboxes read through Microsoft Graph, whose sync jobs copy a mailbox into a Delta feature group as those of Gmail data sources do, also with `OutlookConnector.sync` in the Python client and `hops datasource sync`; `hopsworks.variables.enable_outlook_storage_connectors` turns them off ([Outlook][docs-ds-outlook]).
+- [API] [FRONTEND] Added storing the FILESTREAM columns of a SQL Server table, and the `varbinary(max)` and `image` columns you select, as files in the project when an ingestion job loads it, with each file's path and size in the feature group instead of its bytes, also with `file_columns` of `SinkJobConfiguration` and of `DataSource.get_data` in the Python client ([FILESTREAM and binary columns][docs-ds-sqlserver-files]).
+- [API] [FRONTEND] [HELM] Changed new LLM deployments to vLLM and vLLM-Omni v0.32.0 (`hopsworks.variables.kube_serving_vllm_versions` and `kube_serving_vllm_omni_versions`), which serves GLM-5.3-Flash models; existing deployments keep the version they were created with.
+- [API] [FRONTEND] Added the pi and Hermes Agent coding agents to the Python web terminal, which use the terminal's LLM provider and the Hopsworks skills, and `--agent pi` and `--agent hermes` to `hops skills install` ([LLM provider][docs-terminal-llm]).
+- [API] [FRONTEND] Added connecting a Shopify data source with an app's client ID and secret instead of a private app password, which needs the shop URL `https://<shop>.myshopify.com`, also with `--client-id` and `--client-secret` of `hops datasource create crm`.
+- [API] [FRONTEND] Added Deep Agents, the Tavily search client, the Claude Agent SDK and the Claude Code SDK to the `python-agent-pipeline` environment.
+- [API] Changed `hops datasource info --json`, and the JSON output of `hops datasource credentials set`, `validate` and `show`, to leave out the passwords, tokens, keys and other secrets of the data source, and to show only the scheme, host, port and database of a connection string or URL, or hide it when it holds a login.
+- [FRONTEND] Fixed **Make a copy** of a job overwriting the job whose name the copy was given.
+- [FRONTEND] Fixed the OpenCode and GitHub Copilot sessions of web terminals not being saved every 5 minutes, only when the agent exited or the terminal stopped, so a terminal that was killed, such as for running out of memory, lost what changed since.
+- [FRONTEND] Added **File**, **Main class** and **Default arguments** to **Make a copy** of a job, prefilled from the job, so that a copy can run another program.
+- [FRONTEND] Changed DuckDB in the Python web terminal from 1.5.5 to 2.0.0, both the `duckdb` command and the Python package, with the fts extension besides delta, and added DuckDB 2.0.0 with both extensions to the GPU and Spark terminals.
+- [FRONTEND] Fixed **Make a copy** of a job with environment variables failing with HTTP 400, and **Export** of such a job writing its environment variables in a form the job API does not accept.
+- [FRONTEND] Fixed **Extract** and **Zip folder** in the file browser showing as finished while their job was still waiting in the Kueue queue.
+- [FRONTEND] Fixed saving **Job and Jupyter default configuration** in the project settings failing on clusters with Ray enabled.
+- [HELM] Fixed installing with model serving into a namespace whose ResourceQuota allows no NodePort or LoadBalancer Services failing in the `istioctl-install-job` hook: set `kserve.istio.gateways.ingress.serviceType: ClusterIP` ([ClusterIP gateway][docs-serving-gateway-clusterip]).
+- [HELM] Changed the Strimzi operator to delete Kafka pods with background propagation during a rolling update, so that CNI plugins such as Cilium no longer cut a broker off before it has shut down; `kafka.strimzi-kafka-operator.featureGates: "-UseBackgroundPodDeletion"` keeps the earlier foreground deletion ([Strimzi 1.3][docs-upgrade-strimzi-13]).
+- [HELM] Fixed the Kafka CRD staying `OutOfSync` under ArgoCD; the `ignoreDifferences` entry for it is no longer needed and can stay ([Under ArgoCD][docs-kafka4-argocd]).
+- [HELM] Fixed every `helm upgrade` restarting filebeat on every node.
+- Addressed vulnerabilities in the Hopsworks server, Superset, Superset MySQL, Grafana, Alertmanager, kube-state-metrics, OpenSearch, OpenSearch Dashboards and Logstash images.
+- Fixed REST API audit events not reaching OpenSearch: with the default `audit_log_date_format` it rejected every event, so the `.rest_api_audit-*` indices stayed empty, and with any other format it rejected the events of failed calls; the upgrade deletes the empty audit indices so that today's is created again.
+- Fixed Trino pods staying in `Init` when the HopsFS CSI node plugin restarted or was replaced while they started.
+- Fixed the log files of the HopsFS NameNodes and DataNodes, audit log included, being lost when their container restarts; they now last as long as the pod.
+
+### Breaking changes
+
+- [API] [FRONTEND] Because of a security fix, give the Data scientist role to project members whose use of a data source or of a secret shared with the project fails after the upgrade, with error 380006 or 160047 (HTTP 403) or on the data source's own authentication, or, on the S3 data sources they read that use an IAM role, set a read-only role.
+- [HELM] When you upgrade from 5.2.0, 5.2.1, 5.2.2 or 5.2.3, upgrade a central cluster before its satellites, which needed no order before: a satellite's upgrade refuses to start until its Kafka reports the Strimzi 1.3.1 operator, which central's upgrade installs ([Strimzi 1.3][docs-upgrade-strimzi-13]).
+- [HELM] If your values set `kafka.strimzi-kafka-operator.deploymentStrategy.type: Recreate`, also set `kafka.strimzi-kafka-operator.deploymentStrategy.rollingUpdate: null`, or Kubernetes rejects the Strimzi operator Deployment: the chart now sets `rollingUpdate`, which it left unset before ([Strimzi 1.3][docs-upgrade-strimzi-13]).
+
+### Upgrade steps
+
+Follow [Changes from 5.2.4][docs-upgrade-changes-from-524] in the upgrade guide.
+
+### Upgraded components
+
+| Component | 5.2.3 | 5.2.4 |
+| --------- | ----- | ----- |
+| Alertmanager | 0.34.0-alpine-h2.1 | 0.34.2-alpine-h2.0 |
+| ArrowFlight server | 5.2.1 | 5.2.2 |
+| Base environment images | 5.2.3 | 5.2.4 |
+| Grafana | 12.4.13-h0 | 12.4.14-h0 |
+| HopsFS CSI driver | 0.1.0 | 0.1.1 |
+| Kafka | 1.2.0-kafka-4.3.1-h2 | 1.3.1-kafka-4.3.1-h1 |
+| kube-state-metrics | 2.20.0-alpine-h2.0 | 2.20.0-alpine-h2.1 |
+| Logstash | 7.17.29.7 | 7.17.29.8 |
+| OpenSearch | 3.8.0.0 | 3.8.0.1 |
+| OpenSearch Dashboards | 3.8.0.1 | 3.8.0.2 |
+| Payara | 6.2025.11-jdk21.2 | 6.2025.11-jdk21.4 |
+| Strimzi | 1.2.0 | 1.3.1 |
+| Superset | 6.0.0p4.6 | 6.0.0p4.7 |
+| Superset MySQL | 8.4.13-ubuntu24.04-h0 | 8.4.13-ubuntu24.04-h1 |
+| vLLM | v0.28.0 | v0.32.0 |
+| vLLM-Omni | v0.28.0 | v0.32.0 |
+
+### Configuration changes
+
+- [HELM] Changed the default of `kafka.strimzi-kafka-operator.deploymentStrategy` from the Kubernetes default to `RollingUpdate` with `maxSurge: 0` and `maxUnavailable: 1`, which stops the outgoing Strimzi operator before the new one starts ([Strimzi 1.3][docs-upgrade-strimzi-13]).
+- [HELM] Added `kserve.istio.gateways.ingress.serviceType` (default empty, which keeps a NodePort gateway Service with unmanaged load balancers and a LoadBalancer one otherwise), the Service type of the model serving ingress gateway ([ClusterIP gateway][docs-serving-gateway-clusterip]).
 
 ## 5.2.3 { #hopsworks-5-2-3 }
 
@@ -47765,6 +48904,13 @@ Follow [Before every upgrade][docs-upgrade-before] and [5.1.x to 5.2.x][docs-upg
 [docs-kafka4-argocd]: https://docs.hopsworks.ai/5.2/setup_installation/admin/kafka4/#kafka4-argocd
 [docs-csi-driver-name]: https://docs.hopsworks.ai/5.2/setup_installation/admin/hopsfs_csi/#hopsfs-csi-driver-name
 [docs-csi-admin-scc]: https://docs.hopsworks.ai/5.2/setup_installation/admin/hopsfs_csi/#hopsfs-csi-admin-scc
+[docs-ds-gmail]: https://docs.hopsworks.ai/5.2/user_guides/fs/data_source/creation/gmail/
+[docs-ds-outlook]: https://docs.hopsworks.ai/5.2/user_guides/fs/data_source/creation/outlook/
+[docs-ds-sqlserver-files]: https://docs.hopsworks.ai/5.2/user_guides/fs/data_source/creation/sql/#data-source-sqlserver-files
+[docs-terminal-llm]: https://docs.hopsworks.ai/5.2/user_guides/projects/terminal/start/#llm-provider
+[docs-serving-gateway-clusterip]: https://docs.hopsworks.ai/5.2/setup_installation/admin/model_serving_gateway/#model-serving-gateway-clusterip
+[docs-upgrade-changes-from-524]: https://docs.hopsworks.ai/5.2/setup_installation/admin/upgrade/#upgrade-changes-from-524
+[docs-upgrade-strimzi-13]: https://docs.hopsworks.ai/5.2/setup_installation/admin/upgrade/#upgrade-strimzi-13
 
 ================================================================================
 # 5.1
